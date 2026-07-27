@@ -1,0 +1,179 @@
+diff --git a/inputparmod.f b/inputparmod.f
+index a8eda82..b622ec3 100644
+--- a/inputparmod.f
++++ b/inputparmod.f
+@@ -141,6 +141,8 @@ c-- fontes tabular opacity switch
+       logical :: in_notbffopac = .false. !turn off bound-bound opacity
+       logical :: in_notbthmson = .false. !turn off thomson scattering
+       logical :: in_opfmthdf5 = .false.  !tabular opacity in HDF5 format
++      logical :: in_tbxs_coarse = .false. !read pre-coarsened opacities_coarse.h5 (R4 patch)
++      logical :: in_tbxs_dump = .false.   !dump opacities_coarse.h5 after coarsening (R4 patch)
+ c
+ c-- analytic opacities
+       character(4) :: in_opacanaltype = 'none'    !none|grey|mono|pick|line: group opacity structure type
+@@ -217,7 +219,7 @@ c-- runtime parameter namelist
+ !tabl opac
+      & in_notbopac,
+      & in_notbbbopac,in_notbbfopac,in_notbffopac,in_notbthmson,
+-     & in_opfmthdf5,
++     & in_opfmthdf5,in_tbxs_coarse,in_tbxs_dump,
+ !io
+      & in_io_grabstdout,
+      & in_io_nogriddump,in_io_dogrdtally,
+@@ -370,6 +372,8 @@ c
+       call insertl(in_notbffopac,in_l,il)
+       call insertl(in_notbthmson,in_l,il)
+       call insertl(in_opfmthdf5,in_l,il)
++      call insertl(in_tbxs_coarse,in_l,il)
++      call insertl(in_tbxs_dump,in_l,il)
+ c
+       contains
+ c
+diff --git a/supernu.f90 b/supernu.f90
+index be95f23..726b177 100644
+--- a/supernu.f90
++++ b/supernu.f90
+@@ -116,6 +116,14 @@ program supernu
+ 
+   !-- read and coarsen opacity tables
+   if(lmpi0.and..not.in_notbopac) then
++     if(in_tbxs_coarse) then
++!-- R4 patch: read a pre-coarsened table; skips the multi-GB raw read
++#ifdef USE_HDF5
++        call read_tbxs_coarse(grp_ng,grp_wl)
++#else
++        error stop "in_tbxs_coarse='T' but compiled w/o HDF5"
++#endif
++     else
+      if(in_opfmthdf5) then
+ #ifdef USE_HDF5
+         call read_tbxs_hdf5
+@@ -129,6 +137,11 @@ program supernu
+      lopac=[in_notbbbopac,in_notbbfopac , &
+           in_notbffopac,in_notbthmson]
+      call coarsen_tbxs(lopac,grp_ng,grp_wl)
++!-- R4 patch: optionally persist the coarsened table for reuse
++#ifdef USE_HDF5
++     if(in_tbxs_dump) call dump_tbxs_coarse(grp_ng,grp_wl)
++#endif
++     endif
+   endif
+   !-- broadcast permanent opacity table
+   if(.not.in_notbopac) call bcast_tbxs(grp_ng) !MPI (tbxs opacity should be the same here)
+diff --git a/tbxsmod.f b/tbxsmod.f
+index 8f2977a..9e8e305 100644
+--- a/tbxsmod.f
++++ b/tbxsmod.f
+@@ -332,5 +332,112 @@ c---------------------------------------
+       write(6,*) 'ALLOC tbxs     :',n,"kB",n/1024,"MB",n/1024**2,"GB"
+ c
+       end subroutine coarsen_tbxs
++c
++      subroutine dump_tbxs_coarse(ng,wl)
++c     ----------------------------------
++      use h5aux
++      implicit none
++      integer,intent(in) :: ng
++      real*8,intent(in) :: wl(ng+1)
++************************************************************************
++* R4 patch: dump the group-COARSENED opacity table so later runs skip the
++* ~28 GB raw read. coarsen_tbxs is a pure trapezoid average in inverse-
++* energy space at the table's OWN (T,rho) nodes, with no dependence on the
++* local gas temperature, so this product is exact and reusable for a given
++* (ng, wlmin, wlmax).
++************************************************************************
++      integer(HID_T) :: h5fid
++      real*8,allocatable :: cap8(:,:,:,:)
++      real*8,allocatable :: codes(:)
++      integer :: i
++c
++      allocate(cap8(ng,tb_ntemp,tb_nrho,tb_nelem))
++      allocate(codes(tb_nelem))
++      cap8 = dble(tb_cap)
++      do i=1,tb_nelem
++        codes(i) = dble(tb_ielem(i))
++      enddo
++      h5fid = h5_create('opacities_coarse.h5')
++      call h5_write(h5fid,'cap',cap8)
++      call h5_write(h5fid,'sig',tb_sig)
++      call h5_write(h5fid,'temp',tb_temp)
++      call h5_write(h5fid,'rho',tb_rho)
++      call h5_write(h5fid,'elem_codes',codes)
++      call h5_write_attr(h5fid,'ng',ng)
++      call h5_write_attr(h5fid,'nelem',tb_nelem)
++      call h5_write_attr(h5fid,'wlmin',wl(1))
++      call h5_write_attr(h5fid,'wlmax',wl(ng+1))
++      call h5_close(h5fid)
++      deallocate(cap8,codes)
++      write(6,*) 'wrote opacities_coarse.h5, nelem=',tb_nelem,' ng=',ng
++      end subroutine dump_tbxs_coarse
++c
++c
++c
++      subroutine read_tbxs_coarse(ng,wl)
++c     ----------------------------------
++      use h5aux
++      use inputstrmod, only: str_nabund,str_iabund
++      implicit none
++      integer,intent(in) :: ng
++      real*8,intent(in) :: wl(ng+1)
++************************************************************************
++* R4 patch: read a pre-coarsened table from dump_tbxs_coarse and subset it
++* to the elements present in input.str. Peak memory ~0.3 GB instead of the
++* ~28 GB raw read.
++************************************************************************
++      integer(HID_T) :: h5fid
++      real*8,allocatable :: cap8(:,:,:,:)
++      real*8,allocatable :: sig8(:,:,:)
++      real*8,allocatable :: data1(:)
++      real*8,allocatable :: codes(:)
++      integer,allocatable :: map(:)
++      integer :: ngf,nelemf,i,l,ielem
++      real*8 :: wlminf,wlmaxf
++c
++      if(str_nabund==0) stop 'read_tbxs_coarse: str_nabund=0'
++      h5fid = h5_open('opacities_coarse.h5', readonly_=.true.)
++      call h5_read_attr(ngf, h5fid, 'ng')
++      if(ngf/=ng) stop 'read_tbxs_coarse: ng /= in_grp_ng'
++      call h5_read_attr(nelemf, h5fid, 'nelem')
++      call h5_read_attr(wlminf, h5fid, 'wlmin')
++      call h5_read_attr(wlmaxf, h5fid, 'wlmax')
++      if(abs(wlminf-wl(1))>1d-12*wl(1)) stop
++     &  'read_tbxs_coarse: wlmin mismatch, table built for other grid'
++      if(abs(wlmaxf-wl(ng+1))>1d-12*wl(ng+1)) stop
++     &  'read_tbxs_coarse: wlmax mismatch, table built for other grid'
++      call h5_read(data1, h5fid, 'temp')
++      tb_temp = data1
++      call h5_read(data1, h5fid, 'rho')
++      tb_rho = data1
++      call h5_read(codes, h5fid, 'elem_codes')
++      call h5_read(cap8, h5fid, 'cap')
++      call h5_read(sig8, h5fid, 'sig')
++      call h5_close(h5fid)
++c
++      allocate(map(nelemf))
++      tb_nelem = 0
++      do i=1,nelemf
++        ielem = nint(codes(i))
++        if(any(str_iabund==ielem)) then
++          tb_nelem = tb_nelem + 1
++          map(tb_nelem) = i
++        endif
++      enddo
++      if(tb_nelem<=0) stop 'read_tbxs_coarse: no tabulated element'
++c
++      allocate(tb_ielem(tb_nelem))
++      allocate(tb_cap(ng,tb_ntemp,tb_nrho,tb_nelem))
++      allocate(tb_sig(tb_ntemp,tb_nrho,tb_nelem))
++      do l=1,tb_nelem
++        tb_ielem(l) = nint(codes(map(l)))
++        tb_cap(:,:,:,l) = sngl(cap8(:,:,:,map(l)))
++        tb_sig(:,:,l) = sig8(:,:,map(l))
++      enddo
++      deallocate(cap8,sig8,map,codes,data1)
++      write(6,*) 'read opacities_coarse.h5, using',tb_nelem,'elements'
++      end subroutine read_tbxs_coarse
++c
++c
+ c
+       end module tbxsmod
