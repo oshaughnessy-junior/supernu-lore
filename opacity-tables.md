@@ -15,22 +15,67 @@ Two on-disk forms, same content:
 - Consolidated HDF5 `opacities.h5` (`in_opfmthdf5=t`), one dataset per element
   plus `temperature_grid`, `density_grid`, `wavelength_grid`.
 
+The three grids, and the two ways to misread them if you touch the h5 in Python
+(SuperNu itself reads them correctly — these bite *your* tooling):
+
+- `temperature_grid` — **eV**, ascending (a June-2025 set spans 0.01–5.0 eV, 27
+  pts). `T[K] = T[eV] × 11604.5`.
+- `density_grid` — **actual mass density in g cm⁻³**, ascending (e.g.
+  `1e-20 … 1e-4`, 17 pts). It is **not** an exponent. A handoff note may
+  describe it as "`10^-(value)`" — that is how it was *constructed*
+  (`ρ_i = 10^(i-20)`), not an operation to apply. Running `10**-x` on the stored
+  array gives `≈1.0` everywhere and **silently flattens the density axis**.
+- `wavelength_grid` — dimensionless `u = E/kT` (see the column note below);
+  physical energy is `wavelength_grid * temperature_grid[i]`.
+
 Per element the array is **(17 rho, 27 T, 14900 wavelength, 6 col)** as h5py
 sees it; Fortran reads it transposed. Column mapping (`tbxsmod.f`,
-`tb_raw(2:7,:,:,:,l) = data4`):
+`tb_raw(2:7,:,:,:,l) = data4`), all columns in **cm² g⁻¹**:
 
-| h5 col (0-based) | `tb_raw` row | meaning |
-|---|---|---|
-| 0,1 | 2,3 | (auxiliary) |
-| 2 | 4 | bound-bound |
-| 3 | 5 | bound-free |
-| 4 | 6 | free-free |
-| 5 | 7 | scattering |
+| h5 col (0-based) | `tb_raw` row | meaning | used by SuperNu? |
+|---|---|---|---|
+| 0 | 2 | **total absorption** = col2+col3+col4 | no |
+| 1 | 3 | **total extinction** = col0+col5 | no |
+| 2 | 4 | bound-bound | yes (bb) |
+| 3 | 5 | bound-free | yes (bf) |
+| 4 | 6 | free-free | yes (ff) |
+| 5 | 7 | scattering (**grey** — flat in wavelength) | yes (`tb_sig`) |
+
+Cols 0,1 are **pre-summed totals, not "auxiliary noise"**: SuperNu ignores them
+and rebuilds absorption from the bb/bf/ff components, but the two identities
+hold pointwise to `< 1e-8` relative (we checked fe/nd/sm/u; residual is float32
+round-off inherited from the ASCII source). That makes them a **free
+internal-consistency check** on a table you did not build yourself — the
+verifier below asserts on them. Do **not** add col0 and col1 together: col1
+already contains col0.
 
 `tb_raw(1,...)` is not read from file: it is built as
 `tb_temp(itemp) * wavelength_grid`, i.e. the `wavelength_grid` is a
 **non-dimensional energy** `u = E/T`, so the raw grid in physical energy
-**shifts with the table temperature index**.
+**shifts with the table temperature index**. (The dataset name is a legacy
+misnomer — it is neither a wavelength nor a physical energy. Do not rename it;
+`tbxsmod.f:199` looks it up by that exact string.) Confirmed independently from
+the data: the free-free knee in `κ_ff·u³ ∝ (1−e^{−u})` sits at `u = 0.6925` at
+every non-neutral temperature (spread `1.6e-16`) — fixed in grid units only if
+the grid is already in units of `kT`.
+
+## Verifying a raw table before you trust it
+
+`tools/verify_opacity_table.py` (h5py + numpy; analysis-machine, not a worker)
+runs the full acceptance set on a raw `opacities.h5`: structure, both grid
+conventions, the C-order layout the reader demands, per-element population, the
+component-sum identities above, and two physics invariants (the free-free knee;
+scattering falling with density) that catch a **silently transposed or
+mis-scaled** file which every structural check would still pass. Use `--require`
+to check coverage for a specific composition, not just globally (golden rule 7):
+
+```bash
+python tools/verify_opacity_table.py opacities.h5 --require fe,nd,sm,u
+```
+
+Run it on any new table handoff, and always after rebuilding one from the ASCII
+`op_*.table` files — the transpose trap (`gotchas.md`) aborts SuperNu, but
+nothing warns you until it does.
 
 **Constraint:** every element named in `input.str` must exist in the table set
 or the reader hard-stops. Truncate/renormalise `X_el` to the tabulated list.

@@ -37,6 +37,16 @@ four all produce a **completed run with no warning and a wrong answer**.
   superheavy content, i.e. the low-`Ye` end; a blue-composition test will not
   reveal it. Fix: cap/lump at Z=111 before writing `input.str`.
 
+- **`Array bound mismatch for dimension 1 of array 'tb_raw' (6/17)`** at
+  `tbxsmod.f:209` — the raw `opacities.h5` is **transposed**. Each element
+  dataset must be `(17 rho, 27 T, 14900 wl, 6 col)` in C/h5py order (component
+  axis fastest); Fortran then sees `(6,14900,27,17)`. A writer that emits the
+  axes in the other order produces this abort at load. Only bites tables you
+  rebuilt yourself from the ASCII `op_*.table` files — run
+  `tools/verify_opacity_table.py` after any such rebuild; it catches the
+  transpose (and a *silent* mis-scaling that this abort would not) before you
+  submit. See `opacity-tables.md`.
+
 - **`STOP read_tbxs_coarse: ng /= in_grp_ng`** (with the pre-coarsen patch) —
   the group structure is baked into a coarsened table. `in_grp_ng`,
   `in_grp_wlmin`, `in_grp_wlmax` are then **not free parameters**; changing any
