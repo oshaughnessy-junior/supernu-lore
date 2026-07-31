@@ -67,6 +67,10 @@ Source citations below are against upstream commit
   (GPL-3, derivative of SuperNu; see `LICENSE-NOTES.md`).
 - `tools/make_coarse_opacity.py` — builds the coarsened table using SuperNu
   itself, so generator and consumer can never disagree.
+- `tools/verify_opacity_table.py` — acceptance test for a *raw* `opacities.h5`
+  (h5py + numpy, analysis-machine): structure, grid conventions, C-order
+  layout, per-composition coverage, and physics invariants that catch a
+  silently transposed/mis-scaled table. Run it on any new table handoff.
 
 **Not here, deliberately:** any LANL opacity data. The tables are not ours to
 redistribute. This repo only tells you what to do with a set you already have.
